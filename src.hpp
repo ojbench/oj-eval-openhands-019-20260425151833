@@ -81,43 +81,37 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
     // k_t is no longer needed after scores
     gpu_sim.ReleaseMatrix(k_t);
 
-    // Softmax over rows: exp then divide by row sums
-    Matrix *scores_exp = matrix_memory_allocator.Allocate("scores_exp");
-    gpu_sim.MatExp(scores, scores_exp);
-    // scores no longer needed after exp
-    gpu_sim.ReleaseMatrix(scores);
-
-    Matrix *softmax_mat = nullptr;
+    // Build answer row by row to reduce SRAM
+    Matrix *answer = nullptr;
     for (size_t r = 0; r <= i; ++r) {
-      Matrix *row_r = matrix_memory_allocator.Allocate("row_r");
-      gpu_sim.GetRow(scores_exp, r, row_r, kInSharedMemory);
+      Matrix *row_scores = matrix_memory_allocator.Allocate("row_scores");
+      gpu_sim.GetRow(scores, r, row_scores, kInSharedMemory);
+      Matrix *row_exp = matrix_memory_allocator.Allocate("row_exp");
+      gpu_sim.MatExp(row_scores, row_exp);
       Matrix *row_sum = matrix_memory_allocator.Allocate("row_sum");
-      gpu_sim.Sum(row_r, row_sum);
+      gpu_sim.Sum(row_exp, row_sum);
       Matrix *row_soft = matrix_memory_allocator.Allocate("row_soft");
-      gpu_sim.MatDiv(row_r, row_sum, row_soft);
-      // row_r and row_sum no longer needed
-      gpu_sim.ReleaseMatrix(row_r);
+      gpu_sim.MatDiv(row_exp, row_sum, row_soft);
+      // release intermediates
+      gpu_sim.ReleaseMatrix(row_scores);
+      gpu_sim.ReleaseMatrix(row_exp);
       gpu_sim.ReleaseMatrix(row_sum);
-      if (!softmax_mat) {
-        softmax_mat = row_soft; // reuse the first row directly
+      Matrix *row_out = matrix_memory_allocator.Allocate("row_out");
+      gpu_sim.MatMul(row_soft, v_accum, row_out);
+      gpu_sim.ReleaseMatrix(row_soft);
+      if (!answer) {
+        answer = row_out;
       } else {
-        Matrix *old_softmax = softmax_mat;
-        Matrix *new_softmax = matrix_memory_allocator.Allocate("softmax_step");
-        gpu_sim.Concat(softmax_mat, row_soft, new_softmax, 0, kInSharedMemory);
-        softmax_mat = new_softmax;
-        // release temporaries
-        gpu_sim.ReleaseMatrix(old_softmax);
-        gpu_sim.ReleaseMatrix(row_soft);
+        Matrix *old_ans = answer;
+        Matrix *new_ans = matrix_memory_allocator.Allocate("answer_step");
+        gpu_sim.Concat(answer, row_out, new_ans, 0, kInSharedMemory);
+        answer = new_ans;
+        gpu_sim.ReleaseMatrix(old_ans);
+        gpu_sim.ReleaseMatrix(row_out);
       }
     }
-    // scores_exp no longer needed after softmax construction
-    gpu_sim.ReleaseMatrix(scores_exp);
-
-    // Answer = softmax * V_stack (v_accum)
-    Matrix *answer = matrix_memory_allocator.Allocate("answer");
-    gpu_sim.MatMul(softmax_mat, v_accum, answer);
-    // softmax_mat can be released after use
-    gpu_sim.ReleaseMatrix(softmax_mat);
+    // finished building answer, we can release scores
+    gpu_sim.ReleaseMatrix(scores);
 
     // Move answer to HBM for committing later
     gpu_sim.MoveMatrixToGpuHbm(answer);
