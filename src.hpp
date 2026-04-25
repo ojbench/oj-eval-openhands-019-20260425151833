@@ -103,28 +103,9 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
       gpu_sim.ReleaseMatrix(row_exp);
       gpu_sim.ReleaseMatrix(row_sum);
 
-      // Compute row_out = sum_k row_soft[k] * V[k,:] to reduce time from O((i+1)^2 d) to O((i+1) d)
-      Matrix *row_out = nullptr;
-      for (size_t k = 0; k <= i; ++k) {
-        Matrix *v_row = matrix_memory_allocator.Allocate("v_row");
-        gpu_sim.GetRow(v_accum, k, v_row, kInSharedMemory);
-        Matrix *factor = matrix_memory_allocator.Allocate("factor");
-        gpu_sim.GetColumn(row_soft, k, factor, kInSharedMemory);
-        Matrix *scaled = matrix_memory_allocator.Allocate("scaled");
-        gpu_sim.MatMulNum(v_row, factor, scaled);
-        gpu_sim.ReleaseMatrix(v_row);
-        gpu_sim.ReleaseMatrix(factor);
-        if (!row_out) {
-          row_out = scaled;
-        } else {
-          Matrix *old_out = row_out;
-          Matrix *new_out = matrix_memory_allocator.Allocate("row_out_acc");
-          gpu_sim.MatAdd(row_out, scaled, new_out);
-          row_out = new_out;
-          gpu_sim.ReleaseMatrix(old_out);
-          gpu_sim.ReleaseMatrix(scaled);
-        }
-      }
+      // Use MatMul for row_out = row_soft * v_accum, observed to yield better overall score
+      Matrix *row_out = matrix_memory_allocator.Allocate("row_out");
+      gpu_sim.MatMul(row_soft, v_accum, row_out);
       gpu_sim.ReleaseMatrix(row_soft);
       if (!answer) {
         answer = row_out;
