@@ -40,29 +40,42 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
       gpu_sim.MoveMatrixToSharedMem(current_query);
     }
 
-    // Maintain cumulative K and V stacks across rounds to avoid rebuilding
-    static Matrix *k_accum = nullptr;
-    static Matrix *v_accum = nullptr;
+    // Maintain cumulative K, K^T and V stacks across rounds to avoid rebuilding
+    static Matrix *k_accum = nullptr;   // shape: (i+1, d)
+    static Matrix *kt_accum = nullptr;  // shape: (d, i+1)
+    static Matrix *v_accum = nullptr;   // shape: (i+1, d)
 
     // Move only the newly added key/value to Shared Memory if needed
-    if (keys[i]->GetPosition() == kInGpuHbm) {
-      gpu_sim.MoveMatrixToSharedMem(keys[i]);
-    }
-    if (values[i]->GetPosition() == kInGpuHbm) {
-      gpu_sim.MoveMatrixToSharedMem(values[i]);
-    }
+    if (keys[i]->GetPosition() == kInGpuHbm) gpu_sim.MoveMatrixToSharedMem(keys[i]);
+    if (values[i]->GetPosition() == kInGpuHbm) gpu_sim.MoveMatrixToSharedMem(values[i]);
 
     if (i == 0) {
       k_accum = keys[0];
       v_accum = values[0];
+      // initialize kt_accum = transpose(keys[0])
+      kt_accum = matrix_memory_allocator.Allocate("kt_accum");
+      gpu_sim.Copy(keys[0], kt_accum, kInSharedMemory);
+      gpu_sim.Transpose(kt_accum, kInSharedMemory);
     } else {
+      // update k_accum by appending a new row
       Matrix *prev_k = k_accum;
       Matrix *new_k = matrix_memory_allocator.Allocate("k_accum");
       gpu_sim.Concat(k_accum, keys[i], new_k, 0, kInSharedMemory);
       k_accum = new_k;
-      // Release previous accumulated k (only if it was an allocated concat, i>=2)
       if (i >= 2) gpu_sim.ReleaseMatrix(prev_k);
 
+      // update kt_accum by appending a new column (transpose of keys[i])
+      Matrix *col_i = matrix_memory_allocator.Allocate("k_col");
+      gpu_sim.Copy(keys[i], col_i, kInSharedMemory);
+      gpu_sim.Transpose(col_i, kInSharedMemory);
+      Matrix *prev_kt = kt_accum;
+      Matrix *new_kt = matrix_memory_allocator.Allocate("kt_accum");
+      gpu_sim.Concat(kt_accum, col_i, new_kt, 1, kInSharedMemory);
+      kt_accum = new_kt;
+      gpu_sim.ReleaseMatrix(col_i);
+      if (i >= 2) gpu_sim.ReleaseMatrix(prev_kt);
+
+      // update v_accum by appending a new row
       Matrix *prev_v = v_accum;
       Matrix *new_v = matrix_memory_allocator.Allocate("v_accum");
       gpu_sim.Concat(v_accum, values[i], new_v, 0, kInSharedMemory);
@@ -70,22 +83,15 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
       if (i >= 2) gpu_sim.ReleaseMatrix(prev_v);
     }
 
-    // Compute K^T using a copy so we don't mutate k_accum for future rounds
-    Matrix *k_t = matrix_memory_allocator.Allocate("k_t");
-    gpu_sim.Copy(k_accum, k_t, kInSharedMemory);
-    gpu_sim.Transpose(k_t, kInSharedMemory);
-
-    // Scores = Q * K^T
-    Matrix *scores = matrix_memory_allocator.Allocate("scores");
-    gpu_sim.MatMul(current_query, k_t, scores);
-    // k_t is no longer needed after scores
-    gpu_sim.ReleaseMatrix(k_t);
-
     // Build answer row by row to reduce SRAM
     Matrix *answer = nullptr;
     for (size_t r = 0; r <= i; ++r) {
+      Matrix *row_q = matrix_memory_allocator.Allocate("row_q");
+      gpu_sim.GetRow(current_query, r, row_q, kInSharedMemory);
       Matrix *row_scores = matrix_memory_allocator.Allocate("row_scores");
-      gpu_sim.GetRow(scores, r, row_scores, kInSharedMemory);
+      gpu_sim.MatMul(row_q, kt_accum, row_scores);
+      gpu_sim.ReleaseMatrix(row_q);
+
       Matrix *row_exp = matrix_memory_allocator.Allocate("row_exp");
       gpu_sim.MatExp(row_scores, row_exp);
       Matrix *row_sum = matrix_memory_allocator.Allocate("row_sum");
@@ -96,6 +102,7 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
       gpu_sim.ReleaseMatrix(row_scores);
       gpu_sim.ReleaseMatrix(row_exp);
       gpu_sim.ReleaseMatrix(row_sum);
+
       Matrix *row_out = matrix_memory_allocator.Allocate("row_out");
       gpu_sim.MatMul(row_soft, v_accum, row_out);
       gpu_sim.ReleaseMatrix(row_soft);
@@ -110,8 +117,6 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
         gpu_sim.ReleaseMatrix(row_out);
       }
     }
-    // finished building answer, we can release scores
-    gpu_sim.ReleaseMatrix(scores);
 
     // Move answer to HBM for committing later
     gpu_sim.MoveMatrixToGpuHbm(answer);
