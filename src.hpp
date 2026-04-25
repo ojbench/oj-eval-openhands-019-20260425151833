@@ -40,8 +40,7 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
       gpu_sim.MoveMatrixToSharedMem(current_query);
     }
 
-    // Maintain cumulative K, K^T and V stacks across rounds to avoid rebuilding
-    static Matrix *k_accum = nullptr;   // shape: (i+1, d)
+    // Maintain cumulative K^T (kt_accum) and V stacks across rounds to avoid rebuilding
     static Matrix *kt_accum = nullptr;  // shape: (d, i+1)
     static Matrix *v_accum = nullptr;   // shape: (i+1, d)
 
@@ -50,20 +49,11 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
     if (values[i]->GetPosition() == kInGpuHbm) gpu_sim.MoveMatrixToSharedMem(values[i]);
 
     if (i == 0) {
-      k_accum = keys[0];
       v_accum = values[0];
-      // initialize kt_accum = transpose(keys[0])
       kt_accum = matrix_memory_allocator.Allocate("kt_accum");
       gpu_sim.Copy(keys[0], kt_accum, kInSharedMemory);
       gpu_sim.Transpose(kt_accum, kInSharedMemory);
     } else {
-      // update k_accum by appending a new row
-      Matrix *prev_k = k_accum;
-      Matrix *new_k = matrix_memory_allocator.Allocate("k_accum");
-      gpu_sim.Concat(k_accum, keys[i], new_k, 0, kInSharedMemory);
-      k_accum = new_k;
-      if (i >= 2) gpu_sim.ReleaseMatrix(prev_k);
-
       // update kt_accum by appending a new column (transpose of keys[i])
       Matrix *col_i = matrix_memory_allocator.Allocate("k_col");
       gpu_sim.Copy(keys[i], col_i, kInSharedMemory);
@@ -103,7 +93,7 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
       gpu_sim.ReleaseMatrix(row_exp);
       gpu_sim.ReleaseMatrix(row_sum);
 
-      // Use MatMul for row_out = row_soft * v_accum, observed to yield better overall score
+      // Use MatMul for row_out = row_soft * v_accum
       Matrix *row_out = matrix_memory_allocator.Allocate("row_out");
       gpu_sim.MatMul(row_soft, v_accum, row_out);
       gpu_sim.ReleaseMatrix(row_soft);
